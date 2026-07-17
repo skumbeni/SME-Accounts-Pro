@@ -78,7 +78,7 @@ body {
   height: 64px; padding: 0 32px; display: flex; align-items: center; justify-content: space-between;
   border-bottom: 1px solid var(--line); background: var(--surface);
 }
-.topbar-title { display: flex; flex-direction: column; }
+.topbar-title { display: flex; flex-direction: row; align-items: center; }
 .topbar-title h1 { font-family: var(--font-heading); font-size: 20px; font-weight: 700; color: var(--ink); }
 .topbar-title .crumb { font-size: 11px; color: var(--ink-mute); letter-spacing: 0.06em; text-transform: uppercase; }
 .topbar-actions { display: flex; align-items: center; gap: 10px; }
@@ -277,14 +277,31 @@ tbody tr:last-child td { border-bottom: none; }
 .invoice-doc .totals td { padding: 6px 12px; }
 .invoice-doc .totals .grand td { background: var(--surface-tint); font-weight: 700; font-size: 14px; border-top: 2px solid var(--primary); }
 
+/* ===== Hamburger (mobile nav toggle) ===== */
+.hamburger-btn {
+  display: none; align-items: center; justify-content: center;
+  width: 38px; height: 38px; border-radius: 8px; border: none; cursor: pointer;
+  background: transparent; color: var(--ink); margin-right: 4px; flex-shrink: 0;
+}
+.hamburger-btn:hover { background: var(--bg-alt); }
+.sidebar-backdrop {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+  z-index: 999; opacity: 0; transition: opacity 0.2s ease;
+}
+.sidebar-backdrop.open { display: block; opacity: 1; }
+
 /* ===== Responsive ===== */
 @media (max-width: 1024px) {
   .kpi-grid { grid-template-columns: repeat(3, 1fr); }
   .grid-4 { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 768px) {
-  .sidebar { width: 60px; }
-  .sidebar .brand-text, .sidebar .nav-item span:not(.material-icons), .sidebar .nav-section, .sidebar-footer { display: none; }
+  .hamburger-btn { display: flex; }
+  .sidebar {
+    position: fixed; top: 0; left: 0; height: 100vh; width: 240px; z-index: 1000;
+    transform: translateX(-100%); transition: transform 0.22s ease; box-shadow: 4px 0 24px rgba(0,0,0,0.25);
+  }
+  .sidebar.open { transform: translateX(0); }
   .kpi-grid { grid-template-columns: repeat(2, 1fr); }
   .grid-2, .grid-3, .grid-4, .form-grid { grid-template-columns: 1fr; }
   .row { flex-direction: column; }
@@ -294,7 +311,7 @@ tbody tr:last-child td { border-bottom: none; }
 <body>
 <div class="app">
   <!-- Sidebar -->
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="brand">
       <div class="brand-logo">AP</div>
       <div class="brand-text">
@@ -323,13 +340,17 @@ tbody tr:last-child td { border-bottom: none; }
       <div class="row"><i class="material-icons">storage</i><span>Local data · Offline</span></div>
     </div>
   </aside>
+  <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
 
   <!-- Main -->
   <div class="main">
     <header class="topbar">
       <div class="topbar-title">
+        <button class="hamburger-btn" id="hamburgerBtn" aria-label="Open menu"><i class="material-icons">menu</i></button>
+        <div>
         <span class="crumb" id="crumb">SME Accounting Pro</span>
         <h1 id="pageTitle">Dashboard</h1>
+        </div>
       </div>
       <div class="topbar-actions">
         <div class="topbar-business">
@@ -381,19 +402,87 @@ const K = {
   seeded: 'smeap_seeded_v1'
 };
 
-function load(key) { try { return JSON.parse(localStorage.getItem(key) || '[]'); } catch { return []; } }
-function save(key, val) { localStorage.setItem(key, JSON.stringify(val)); }
+// In-memory cache mirrors localStorage so repeated load(key) calls within (and across)
+// render passes don't each re-run JSON.parse over the same data. save() keeps it in sync.
+let dataCache = {};
+function load(key) {
+  if (!(key in dataCache)) {
+    try { dataCache[key] = JSON.parse(localStorage.getItem(key) || '[]'); }
+    catch { dataCache[key] = []; }
+  }
+  return dataCache[key];
+}
+let dataVersion = 0;
+function save(key, val) {
+  localStorage.setItem(key, JSON.stringify(val));
+  dataCache[key] = val;
+  dataVersion++;
+}
 function loadObj(key, def) { try { return JSON.parse(localStorage.getItem(key) || 'null') || def; } catch { return def; } }
 function uid(prefix) { return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2,6); }
+function indexById(arr) {
+  const map = {};
+  arr.forEach(x => { map[x.id] = x; });
+  return map;
+}
+
+// ============= Pagination =============
+const PAGE_SIZE = 25;
+function paginate(arr, page, size = PAGE_SIZE) {
+  const totalPages = Math.max(1, Math.ceil(arr.length / size));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const start = (safePage - 1) * size;
+  return { items: arr.slice(start, start + size), page: safePage, totalPages, total: arr.length };
+}
+function renderPager(page, totalPages, goFn) {
+  if (totalPages <= 1) return '';
+  return `
+    <div class="flex-between mt-md" style="padding:10px 2px 2px">
+      <div class="text-mute" style="font-size:12px">Page ${page} of ${totalPages}</div>
+      <div class="flex gap-sm">
+        <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="${goFn}(${page - 1})"><i class="material-icons">chevron_left</i>Prev</button>
+        <button class="btn btn-ghost btn-sm" ${page >= totalPages ? 'disabled' : ''} onclick="${goFn}(${page + 1})">Next<i class="material-icons">chevron_right</i></button>
+      </div>
+    </div>
+  `;
+}
+
+// ============= Virtualized table rendering =============
+// For tables whose row count grows unbounded (invoices, over time), only the rows
+// inside the scroll viewport (+ overscan buffer) are ever put in the DOM. Two spacer
+// rows above/below hold the scrollbar's correct height/position without rendering
+// the rows they represent. This scales to thousands of records without slowdown,
+// vs. pagination which still forces a re-render of the whole page-size chunk.
+function createVirtualTable(scrollEl, tbodyEl, items, rowHeight, renderRow, overscan = 8) {
+  function renderRange() {
+    const total = items.length;
+    if (!total) { tbodyEl.innerHTML = ''; return; }
+    const scrollTop = scrollEl.scrollTop;
+    const viewportH = scrollEl.clientHeight || 400;
+    const startIdx = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+    const visibleCount = Math.ceil(viewportH / rowHeight) + overscan * 2;
+    const endIdx = Math.min(total, startIdx + visibleCount);
+    const topH = startIdx * rowHeight;
+    const bottomH = (total - endIdx) * rowHeight;
+
+    let html = topH > 0 ? `<tr aria-hidden="true" style="height:${topH}px;padding:0;border:0"><td colspan="99" style="padding:0;border:0"></td></tr>` : '';
+    for (let i = startIdx; i < endIdx; i++) html += renderRow(items[i], i);
+    if (bottomH > 0) html += `<tr aria-hidden="true" style="height:${bottomH}px;padding:0;border:0"><td colspan="99" style="padding:0;border:0"></td></tr>`;
+    tbodyEl.innerHTML = html;
+  }
+  scrollEl.onscroll = () => window.requestAnimationFrame(renderRange);
+  renderRange();
+  return { refresh: renderRange };
+}
 
 // ============= Settings =============
 let settings = loadObj(K.settings, {
-  businessName: 'Mutinta General Dealers',
-  tpin: '1002003004',
-  email: 'info@mutintageneral.co.zm',
-  phone: '+260977123456',
-  whatsapp: '260977123456',
-  address: 'Plot 1234, Cairo Road, Lusaka, Zambia',
+  businessName: 'Your Business Name',
+  tpin: '',
+  email: '',
+  phone: '',
+  whatsapp: '',
+  address: '',
   vatRegistered: true,
   currency: 'ZMW',
   fiscalYearStart: '01-01'
@@ -534,94 +623,13 @@ function openWhatsAppHelp() {
 function seedIfEmpty() {
   if (localStorage.getItem(K.seeded)) return;
 
-  const customers = [
-    { id: 'c1', name: 'Protea Hotels Lusaka', phone: '+260211000111', email: 'ap@protea.co.zm', address: 'Protea Tower, Cairo Rd', openingBalance: 0 },
-    { id: 'c2', name: 'Copperbelt Mining Supplies', phone: '+260962222333', email: 'finance@cbmining.co.zm', address: 'Kitwe Industrial Area', openingBalance: 12500 },
-    { id: 'c3', name: 'St. Mary\'s Secondary School', phone: '+260955444555', email: 'bursar@stmarys.edu.zm', address: 'Ndola Road, Kabwe', openingBalance: 0 },
-    { id: 'c4', name: 'Mukuni Curio Market', phone: '+260977666777', email: '', address: 'Livingstone', openingBalance: 3400 },
-    { id: 'c5', name: 'Chilanga Breweries Ltd', phone: '+260211888999', email: 'accounts@chilangabrew.co.zm', address: 'Kafue Rd, Chilanga', openingBalance: 0 }
-  ];
-
-  const suppliers = [
-    { id: 's1', name: 'Trade Kings Wholesale', phone: '+260211555000', email: 'sales@tradekings.co.zm', address: 'Light Industrial, Lusaka', openingBalance: 8500 },
-    { id: 's2', name: 'Spar Distribution Centre', phone: '+260211444333', email: 'supply@spar.co.zm', address: 'Leopards Hill Rd', openingBalance: 0 },
-    { id: 's3', name: 'Total Energies Lusaka', phone: '+260967111222', email: 'fleet@total.co.zm', address: 'Independence Ave', openingBalance: 0 }
-  ];
-
-  const products = [
-    { id: 'p1', name: 'A4 Paper Ream (80gsm)', sku: 'STA-A4-80', category: 'Stationery', costPrice: 85, sellingPrice: 120, stockQty: 240, reorderLevel: 50, unit: 'ream' },
-    { id: 'p2', name: 'Bic Ballpoint Pen (Box 50)', sku: 'STA-PEN-50', category: 'Stationery', costPrice: 65, sellingPrice: 110, stockQty: 38, reorderLevel: 20, unit: 'box' },
-    { id: 'p3', name: 'HP LaserJet Toner CF259A', sku: 'PRN-TN-59A', category: 'Printing', costPrice: 850, sellingPrice: 1250, stockQty: 12, reorderLevel: 5, unit: 'unit' },
-    { id: 'p4', name: 'Diesel (per litre)', sku: 'FLT-DIESEL', category: 'Fuel', costPrice: 28.50, sellingPrice: 0, stockQty: 0, reorderLevel: 0, unit: 'litre' },
-    { id: 'p5', name: 'Office Chair Executive', sku: 'FRN-CHR-EX', category: 'Furniture', costPrice: 1450, sellingPrice: 2200, stockQty: 8, reorderLevel: 3, unit: 'unit' },
-    { id: 'p6', name: 'Notebook 200pg (Assorted)', sku: 'STA-NB-200', category: 'Stationery', costPrice: 22, sellingPrice: 38, stockQty: 180, reorderLevel: 40, unit: 'unit' },
-    { id: 'p7', name: 'Stapler Heavy Duty', sku: 'STA-STP-HD', category: 'Stationery', costPrice: 95, sellingPrice: 165, stockQty: 6, reorderLevel: 4, unit: 'unit' },
-    { id: 'p8', name: 'A3 Print Card (Full Colour)', sku: 'PRN-A3-CLR', category: 'Printing', costPrice: 8, sellingPrice: 25, stockQty: 480, reorderLevel: 100, unit: 'sheet' }
-  ];
-
-  // Invoices - spread across last 60 days
-  const now = new Date();
-  function daysAgo(n) { const d = new Date(now); d.setDate(d.getDate() - n); return d.toISOString().slice(0,10); }
-  const invoices = [
-    {
-      id: 'i1', type: 'tax_invoice', number: 'TI-2025-0001', customerId: 'c1', date: daysAgo(2), dueDate: daysAgo(-12),
-      items: [{ productId: 'p1', name: 'A4 Paper Ream (80gsm)', qty: 50, price: 120, vatRate: 0.16 }, { productId: 'p3', name: 'HP LaserJet Toner CF259A', qty: 2, price: 1250, vatRate: 0.16 }],
-      subtotal: 8500, vatAmount: 1360, total: 9860, status: 'sent', notes: 'Delivery to reception.', payments: []
-    },
-    {
-      id: 'i2', type: 'tax_invoice', number: 'TI-2025-0002', customerId: 'c2', date: daysAgo(8), dueDate: daysAgo(7),
-      items: [{ productId: 'p5', name: 'Office Chair Executive', qty: 4, price: 2200, vatRate: 0.16 }],
-      subtotal: 8800, vatAmount: 1408, total: 10208, status: 'overdue', notes: '', payments: []
-    },
-    {
-      id: 'i3', type: 'tax_invoice', number: 'TI-2025-0003', customerId: 'c3', date: daysAgo(15), dueDate: daysAgo(-15),
-      items: [{ productId: 'p2', name: 'Bic Ballpoint Pen (Box 50)', qty: 10, price: 110, vatRate: 0.16 }, { productId: 'p6', name: 'Notebook 200pg (Assorted)', qty: 80, price: 38, vatRate: 0.16 }],
-      subtotal: 4140, vatAmount: 662.40, total: 4802.40, status: 'paid', notes: 'School supply order', payments: [{ id: 'pay1', date: daysAgo(10), amount: 4802.40, method: 'bank', reference: 'BANK-TRF-9921' }]
-    },
-    {
-      id: 'i4', type: 'receipt', number: 'RC-2025-0001', customerId: 'c4', date: daysAgo(1),
-      items: [{ productId: 'p8', name: 'A3 Print Card (Full Colour)', qty: 30, price: 25, vatRate: 0 }],
-      subtotal: 750, vatAmount: 0, total: 750, status: 'paid', notes: 'Cash sale', payments: [{ id: 'pay2', date: daysAgo(1), amount: 750, method: 'cash', reference: 'CASH' }]
-    },
-    {
-      id: 'i5', type: 'quotation', number: 'QT-2025-0001', customerId: 'c5', date: daysAgo(3), dueDate: daysAgo(-7),
-      items: [{ productId: 'p1', name: 'A4 Paper Ream (80gsm)', qty: 200, price: 115, vatRate: 0.16 }, { productId: 'p7', name: 'Stapler Heavy Duty', qty: 15, price: 160, vatRate: 0.16 }],
-      subtotal: 25500, vatAmount: 4080, total: 29580, status: 'sent', notes: 'Volume discount applied', payments: []
-    },
-    {
-      id: 'i6', type: 'tax_invoice', number: 'TI-2025-0004', customerId: 'c1', date: daysAgo(25), dueDate: daysAgo(10),
-      items: [{ productId: 'p3', name: 'HP LaserJet Toner CF259A', qty: 5, price: 1250, vatRate: 0.16 }],
-      subtotal: 6250, vatAmount: 1000, total: 7250, status: 'paid', notes: '', payments: [{ id: 'pay3', date: daysAgo(18), amount: 7250, method: 'mobile_money', reference: 'AIRTEL-MM-44521' }]
-    }
-  ];
-
-  // Expenses - last 30 days
-  const expenses = [
-    { id: 'e1', date: daysAgo(1), category: 'fuel', description: 'Diesel fill — Toyota Hilux', amount: 580, paymentMethod: 'cash', supplierId: 's3' },
-    { id: 'e2', date: daysAgo(2), category: 'utilities', description: 'ZESCO electricity — July', amount: 1240, paymentMethod: 'bank', supplierId: '' },
-    { id: 'e3', date: daysAgo(5), category: 'salaries', description: 'Casual worker — week 1', amount: 1800, paymentMethod: 'cash', supplierId: '' },
-    { id: 'e4', date: daysAgo(7), category: 'airtime', description: 'Airtel data bundles — sales team', amount: 350, paymentMethod: 'mobile_money', supplierId: '' },
-    { id: 'e5', date: daysAgo(10), category: 'repairs', description: 'Office printer service', amount: 420, paymentMethod: 'cash', supplierId: '' },
-    { id: 'e6', date: daysAgo(12), category: 'fuel', description: 'Diesel fill — delivery van', amount: 720, paymentMethod: 'mobile_money', supplierId: 's3' },
-    { id: 'e7', date: daysAgo(15), category: 'utilities', description: 'Water — Lusaka Water', amount: 280, paymentMethod: 'bank', supplierId: '' },
-    { id: 'e8', date: daysAgo(18), category: 'other', description: 'Shop rent — August', amount: 4500, paymentMethod: 'bank', supplierId: '' },
-    { id: 'e9', date: daysAgo(22), category: 'salaries', description: 'Bookkeeper — July', amount: 3500, paymentMethod: 'bank', supplierId: '' },
-    { id: 'e10', date: daysAgo(28), category: 'fuel', description: 'Diesel fill — Hilux', amount: 640, paymentMethod: 'mobile_money', supplierId: 's3' }
-  ];
-
-  const employees = [
-    { id: 'emp1', name: 'Grace Phiri', position: 'Operations Manager', grossSalary: 12000, napsaNo: 'NAP-001', nhipNo: 'NHI-001', payeNo: 'TPIN-1001', bankAccount: 'ZICB 0123456789', active: true },
-    { id: 'emp2', name: 'Joseph Banda', position: 'Sales Assistant', grossSalary: 5500, napsaNo: 'NAP-002', nhipNo: 'NHI-002', payeNo: 'TPIN-1002', bankAccount: 'FNB 9876543210', active: true },
-    { id: 'emp3', name: 'Esther Mwape', position: 'Bookkeeper', grossSalary: 8000, napsaNo: 'NAP-003', nhipNo: 'NHI-003', payeNo: 'TPIN-1003', bankAccount: 'Stanbic 555666777', active: true },
-    { id: 'emp4', name: 'Peter Mulenga', position: 'Driver', grossSalary: 4500, napsaNo: 'NAP-004', nhipNo: 'NHI-004', payeNo: 'TPIN-1004', bankAccount: 'ZICB 1122334455', active: true }
-  ];
-
-  save(K.customers, customers);
-  save(K.suppliers, suppliers);
-  save(K.products, products);
-  save(K.invoices, invoices);
-  save(K.expenses, expenses);
-  save(K.employees, employees);
+  // Fresh install: start with empty registers, no demo records.
+  save(K.customers, []);
+  save(K.suppliers, []);
+  save(K.products, []);
+  save(K.invoices, []);
+  save(K.expenses, []);
+  save(K.employees, []);
   save(K.payments, []);
   save(K.payroll, []);
   localStorage.setItem(K.seeded, '1');
@@ -659,7 +667,11 @@ function updateInvoice(updated) {
 }
 
 // ============= Stats helpers =============
+let dashboardStatsCache = { cacheKey: null, stats: null };
 function getDashboardStats() {
+  const cacheKey = `${dataVersion}:${today()}`;
+  if (dashboardStatsCache.cacheKey === cacheKey) return dashboardStatsCache.stats;
+
   const invoices = load(K.invoices).filter(i => i.type !== 'quotation' && i.type !== 'credit_note');
   const expenses = load(K.expenses);
   const products = load(K.products);
@@ -674,9 +686,10 @@ function getDashboardStats() {
   const monthlyExpenses = expenses.filter(e => monthKey(e.date) === mk).reduce((s, e) => s + Number(e.amount), 0);
 
   // Net profit = sales - COGS - expenses (approximate using margin)
+  const productsById = indexById(products);
   const cogs = monthlyInvs.reduce((s, i) => {
     return s + i.items.reduce((cs, it) => {
-      const prod = products.find(p => p.id === it.productId);
+      const prod = productsById[it.productId];
       return cs + (prod ? prod.costPrice * it.qty : 0);
     }, 0);
   }, 0);
@@ -694,7 +707,9 @@ function getDashboardStats() {
   // Inventory value
   const inventoryValue = products.reduce((s, p) => s + (p.costPrice * p.stockQty), 0);
 
-  return { dailySales, monthlySales, monthlyExpenses, netProfit, taxDue, outstanding, inventoryValue, vatCollected, turnoverTax };
+  const stats = { dailySales, monthlySales, monthlyExpenses, netProfit, taxDue, outstanding, inventoryValue, vatCollected, turnoverTax };
+  dashboardStatsCache = { cacheKey, stats };
+  return stats;
 }
 
 // ============= Charts =============
@@ -702,6 +717,40 @@ let chartRegistry = {};
 function destroyCharts() {
   Object.values(chartRegistry).forEach(c => { try { c.destroy(); } catch {} });
   chartRegistry = {};
+}
+// Aggregating 6 months of invoices / this month's expenses is the expensive part of
+// loading the dashboard, not the Chart.js instantiation itself. Cache the aggregated
+// result and only recompute when the underlying data (or the calendar month) has
+// actually changed since the last time the dashboard was rendered.
+let dashboardChartCache = { cacheKey: null, sales: null, expense: null };
+function getDashboardChartData() {
+  const cacheKey = `${dataVersion}:${currentMonthKey()}`;
+  if (dashboardChartCache.cacheKey === cacheKey) return dashboardChartCache;
+
+  const allInvoices = load(K.invoices).filter(i => i.type !== 'quotation' && i.type !== 'credit_note');
+  const months = [];
+  for (let i = 5; i >= 0; i--) {
+    const d = new Date(); d.setMonth(d.getMonth() - i);
+    months.push(d.toISOString().slice(0,7));
+  }
+  const salesByMonth = months.map(m => allInvoices.filter(i => monthKey(i.date) === m).reduce((s, i) => s + i.total, 0));
+
+  const expenses = load(K.expenses).filter(e => monthKey(e.date) === currentMonthKey());
+  const catTotals = {};
+  expenses.forEach(e => { catTotals[e.category] = (catTotals[e.category] || 0) + Number(e.amount); });
+  const catLabels = { fuel: 'Fuel', salaries: 'Salaries', utilities: 'Utilities', repairs: 'Repairs', airtime: 'Airtime', other: 'Other' };
+  const catColors = { fuel: '#1A4D2E', salaries: '#D4A437', utilities: '#2C5F8D', repairs: '#C77A1A', airtime: '#2A6B43', other: '#8A8A8A' };
+
+  dashboardChartCache = {
+    cacheKey,
+    sales: { labels: months.map(monthLabel), data: salesByMonth },
+    expense: {
+      labels: Object.keys(catTotals).map(k => catLabels[k] || k),
+      data: Object.values(catTotals),
+      colors: Object.keys(catTotals).map(k => catColors[k] || '#8A8A8A')
+    }
+  };
+  return dashboardChartCache;
 }
 
 // ============= Router =============
@@ -734,8 +783,20 @@ function navigate(route) {
 }
 
 document.querySelectorAll('.nav-item').forEach(n => {
-  n.addEventListener('click', e => { e.preventDefault(); navigate(n.dataset.route); });
+  n.addEventListener('click', e => { e.preventDefault(); navigate(n.dataset.route); closeSidebar(); });
 });
+
+// ============= Mobile hamburger nav =============
+function openSidebar() {
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('sidebarBackdrop').classList.add('open');
+}
+function closeSidebar() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('sidebarBackdrop').classList.remove('open');
+}
+document.getElementById('hamburgerBtn').addEventListener('click', openSidebar);
+document.getElementById('sidebarBackdrop').addEventListener('click', closeSidebar);
 
 // ============= Page: Dashboard =============
 function renderDashboard(root) {
@@ -839,22 +900,16 @@ function renderDashboard(root) {
     </div>
   `;
 
-  // Sales chart (last 6 months)
-  const allInvoices = load(K.invoices).filter(i => i.type !== 'quotation' && i.type !== 'credit_note');
-  const months = [];
-  for (let i = 5; i >= 0; i--) {
-    const d = new Date(); d.setMonth(d.getMonth() - i);
-    months.push(d.toISOString().slice(0,7));
-  }
-  const salesByMonth = months.map(m => allInvoices.filter(i => monthKey(i.date) === m).reduce((s, i) => s + i.total, 0));
+  // Sales chart (last 6 months) — aggregation is cached, only rebuilt when data/month changes
+  const { sales, expense } = getDashboardChartData();
 
   chartRegistry.sales = new Chart(document.getElementById('salesChart'), {
     type: 'bar',
     data: {
-      labels: months.map(monthLabel),
+      labels: sales.labels,
       datasets: [{
         label: 'Sales (ZMW)',
-        data: salesByMonth,
+        data: sales.data,
         backgroundColor: '#1A4D2E',
         borderRadius: 6,
         barThickness: 32
@@ -871,19 +926,13 @@ function renderDashboard(root) {
   });
 
   // Expense chart
-  const expenses = load(K.expenses).filter(e => monthKey(e.date) === currentMonthKey());
-  const catTotals = {};
-  expenses.forEach(e => { catTotals[e.category] = (catTotals[e.category] || 0) + Number(e.amount); });
-  const catLabels = { fuel: 'Fuel', salaries: 'Salaries', utilities: 'Utilities', repairs: 'Repairs', airtime: 'Airtime', other: 'Other' };
-  const catColors = { fuel: '#1A4D2E', salaries: '#D4A437', utilities: '#2C5F8D', repairs: '#C77A1A', airtime: '#2A6B43', other: '#8A8A8A' };
-
   chartRegistry.expense = new Chart(document.getElementById('expenseChart'), {
     type: 'doughnut',
     data: {
-      labels: Object.keys(catTotals).map(k => catLabels[k] || k),
+      labels: expense.labels,
       datasets: [{
-        data: Object.values(catTotals),
-        backgroundColor: Object.keys(catTotals).map(k => catColors[k] || '#8A8A8A'),
+        data: expense.data,
+        backgroundColor: expense.colors,
         borderWidth: 2, borderColor: '#FFFFFF'
       }]
     },
@@ -899,14 +948,14 @@ function renderDashboard(root) {
 
 function renderRecentInvoicesTable() {
   const invoices = load(K.invoices).sort((a,b) => b.date.localeCompare(a.date)).slice(0,5);
-  const customers = load(K.customers);
+  const customersById = indexById(load(K.customers));
   if (!invoices.length) return `<div class="empty"><i class="material-icons">receipt_long</i><p>No invoices yet.</p></div>`;
   return `
     <table>
       <thead><tr><th>Number</th><th>Customer</th><th class="t-num">Amount</th><th>Status</th></tr></thead>
       <tbody>
         ${invoices.map(inv => {
-          const cust = customers.find(c => c.id === inv.customerId);
+          const cust = customersById[inv.customerId];
           const statusBadge = { draft: 'badge-mute', sent: 'badge-info', paid: 'badge-success', overdue: 'badge-danger', cancelled: 'badge-mute' }[inv.status] || 'badge-mute';
           return `
             <tr style="cursor:pointer" onclick="viewInvoice('${inv.id}')">
@@ -924,35 +973,60 @@ function renderRecentInvoicesTable() {
 
 // ============= Page: Invoices =============
 let invoiceFilter = 'all';
-function renderInvoices(root) {
+const INVOICE_TYPE_CHIPS = [
+  { k: 'all', label: 'All Documents' },
+  { k: 'quotation', label: 'Quotations' },
+  { k: 'proforma', label: 'Proforma Invoices' },
+  { k: 'tax_invoice', label: 'Tax Invoices' },
+  { k: 'receipt', label: 'Receipts' },
+  { k: 'credit_note', label: 'Credit Notes' }
+];
+function buildInvoiceChips() {
+  return INVOICE_TYPE_CHIPS.map(c => `<div class="chip ${invoiceFilter === c.k ? 'active' : ''}" onclick="setInvoiceFilter('${c.k}')">${c.label}</div>`).join('');
+}
+const INVOICE_ROW_HEIGHT = 49; // px — must match the actual rendered <tr> height for virtual scroll math to line up
+let invoiceVT = null; // current createVirtualTable() handle for the invoices list
+function renderInvoiceRow(inv, customersById) {
+  const cust = customersById[inv.customerId];
+  const typeLabel = { quotation: 'Quotation', proforma: 'Proforma', tax_invoice: 'Tax Invoice', receipt: 'Receipt', credit_note: 'Credit Note' }[inv.type];
+  const statusBadge = { draft: 'badge-mute', sent: 'badge-info', paid: 'badge-success', overdue: 'badge-danger', cancelled: 'badge-mute' }[inv.status] || 'badge-mute';
+  return `
+    <tr>
+      <td class="t-mono bold" style="cursor:pointer;color:var(--primary)" data-action="view" data-id="${inv.id}">${inv.number}</td>
+      <td><span class="badge badge-accent">${typeLabel}</span></td>
+      <td>${cust ? cust.name : 'Walk-in Customer'}</td>
+      <td>${fmtDate(inv.date)}</td>
+      <td>${inv.dueDate ? fmtDate(inv.dueDate) : '—'}</td>
+      <td class="t-num bold">${fmt(inv.total)}</td>
+      <td><span class="badge ${statusBadge}">${inv.status}</span></td>
+      <td>
+        <div class="flex gap-sm">
+          <button class="btn btn-ghost btn-icon" title="View" data-action="view" data-id="${inv.id}"><i class="material-icons">visibility</i></button>
+          <button class="btn btn-wa btn-icon" title="Send WhatsApp" data-action="whatsapp" data-id="${inv.id}"><i class="material-icons">chat</i></button>
+        </div>
+      </td>
+    </tr>
+  `;
+}
+// One delegated listener handles every row's actions, however many rows exist or
+// get swapped in/out by virtual scrolling — no per-row onclick parsing/attachment.
+function handleInvoiceTbodyClick(e) {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  const id = el.dataset.id;
+  if (el.dataset.action === 'view') viewInvoice(id);
+  else if (el.dataset.action === 'whatsapp') sendInvoiceWhatsApp(load(K.invoices).find(i => i.id === id));
+}
+function getFilteredInvoices() {
   const invoices = load(K.invoices).sort((a,b) => b.date.localeCompare(a.date));
-  const filtered = invoiceFilter === 'all' ? invoices : invoices.filter(i => i.type === invoiceFilter);
-
-  root.innerHTML = `
-    <div class="page-header">
-      <div>
-        <h2>Sales &amp; Tax Invoices</h2>
-        <div class="sub">Quotations, proforma, tax invoices, receipts and credit notes — all ZRA-compliant.</div>
-      </div>
-      <div class="flex gap-sm">
-        <button class="btn btn-ghost btn-sm" onclick="navigate('dashboard')"><i class="material-icons">dashboard</i>Dashboard</button>
-        <button class="btn btn-wa btn-sm" onclick="openWhatsAppHelp()"><i class="material-icons">chat</i>Send via WhatsApp</button>
-        <button class="btn btn-primary" onclick="openInvoiceModal()"><i class="material-icons">add</i>New Document</button>
-      </div>
-    </div>
-
-    <div class="chip-row">
-      ${[
-        { k: 'all', label: 'All Documents' },
-        { k: 'quotation', label: 'Quotations' },
-        { k: 'proforma', label: 'Proforma Invoices' },
-        { k: 'tax_invoice', label: 'Tax Invoices' },
-        { k: 'receipt', label: 'Receipts' },
-        { k: 'credit_note', label: 'Credit Notes' }
-      ].map(c => `<div class="chip ${invoiceFilter === c.k ? 'active' : ''}" onclick="setInvoiceFilter('${c.k}')">${c.label}</div>`).join('')}
-    </div>
-
-    <div class="table-wrap">
+  return invoiceFilter === 'all' ? invoices : invoices.filter(i => i.type === invoiceFilter);
+}
+function buildInvoiceTableSection() {
+  // Shell only — the tbody starts empty and is populated by setupInvoiceVirtualTable()
+  // once this HTML is actually in the DOM (virtual scroll needs real element geometry).
+  return `
+    <div class="text-mute" style="font-size:12px;padding:2px 2px 8px">${getFilteredInvoices().length} document(s)</div>
+    <div id="invoiceScroll" style="max-height:560px;overflow-y:auto;overflow-x:auto">
       <table>
         <thead>
           <tr>
@@ -966,35 +1040,58 @@ function renderInvoices(root) {
             <th></th>
           </tr>
         </thead>
-        <tbody>
-          ${filtered.length ? filtered.map(inv => {
-            const cust = load(K.customers).find(c => c.id === inv.customerId);
-            const typeLabel = { quotation: 'Quotation', proforma: 'Proforma', tax_invoice: 'Tax Invoice', receipt: 'Receipt', credit_note: 'Credit Note' }[inv.type];
-            const statusBadge = { draft: 'badge-mute', sent: 'badge-info', paid: 'badge-success', overdue: 'badge-danger', cancelled: 'badge-mute' }[inv.status] || 'badge-mute';
-            return `
-              <tr>
-                <td class="t-mono bold" style="cursor:pointer;color:var(--primary)" onclick="viewInvoice('${inv.id}')">${inv.number}</td>
-                <td><span class="badge badge-accent">${typeLabel}</span></td>
-                <td>${cust ? cust.name : 'Walk-in Customer'}</td>
-                <td>${fmtDate(inv.date)}</td>
-                <td>${inv.dueDate ? fmtDate(inv.dueDate) : '—'}</td>
-                <td class="t-num bold">${fmt(inv.total)}</td>
-                <td><span class="badge ${statusBadge}">${inv.status}</span></td>
-                <td>
-                  <div class="flex gap-sm">
-                    <button class="btn btn-ghost btn-icon" title="View" onclick="viewInvoice('${inv.id}')"><i class="material-icons">visibility</i></button>
-                    <button class="btn btn-wa btn-icon" title="Send WhatsApp" onclick="sendInvoiceWhatsApp(load(K.invoices).find(i=>i.id==='${inv.id}'))"><i class="material-icons">chat</i></button>
-                  </div>
-                </td>
-              </tr>
-            `;
-          }).join('') : `<tr><td colspan="8"><div class="empty"><i class="material-icons">receipt_long</i><p>No documents yet. Click "New Document" to create one.</p></div></td></tr>`}
-        </tbody>
+        <tbody id="invoiceTbody"></tbody>
       </table>
     </div>
   `;
 }
-function setInvoiceFilter(k) { invoiceFilter = k; navigate('invoices'); }
+// Wires up the virtual scroller against the live DOM nodes. Must run after the
+// buildInvoiceTableSection() HTML has been assigned to innerHTML somewhere.
+function setupInvoiceVirtualTable() {
+  const scrollEl = document.getElementById('invoiceScroll');
+  const tbodyEl = document.getElementById('invoiceTbody');
+  if (!scrollEl || !tbodyEl) return;
+  tbodyEl.addEventListener('click', handleInvoiceTbodyClick); // one listener for the whole body; survives virtual-scroll re-renders since only innerHTML is swapped
+  const filtered = getFilteredInvoices();
+  if (!filtered.length) {
+    tbodyEl.innerHTML = `<tr><td colspan="8"><div class="empty"><i class="material-icons">receipt_long</i><p>No documents yet. Click "New Document" to create one.</p></div></td></tr>`;
+    invoiceVT = null;
+    return;
+  }
+  const customersById = indexById(load(K.customers));
+  invoiceVT = createVirtualTable(scrollEl, tbodyEl, filtered, INVOICE_ROW_HEIGHT, (inv) => renderInvoiceRow(inv, customersById));
+}
+function renderInvoices(root) {
+  root.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h2>Sales &amp; Tax Invoices</h2>
+        <div class="sub">Quotations, proforma, tax invoices, receipts and credit notes — all ZRA-compliant.</div>
+      </div>
+      <div class="flex gap-sm">
+        <button class="btn btn-ghost btn-sm" onclick="navigate('dashboard')"><i class="material-icons">dashboard</i>Dashboard</button>
+        <button class="btn btn-wa btn-sm" onclick="openWhatsAppHelp()"><i class="material-icons">chat</i>Send via WhatsApp</button>
+        <button class="btn btn-primary" onclick="openInvoiceModal()"><i class="material-icons">add</i>New Document</button>
+      </div>
+    </div>
+
+    <div class="chip-row" id="invoiceChipRow">${buildInvoiceChips()}</div>
+
+    <div class="table-wrap" id="invoiceTableSection">${buildInvoiceTableSection()}</div>
+  `;
+  setupInvoiceVirtualTable();
+}
+// In-page updates (filter change) patch only the chip row and table instead of
+// tearing down and rebuilding the whole page via navigate().
+function refreshInvoicesView() {
+  const chipRow = document.getElementById('invoiceChipRow');
+  const tableSection = document.getElementById('invoiceTableSection');
+  if (!chipRow || !tableSection) { navigate('invoices'); return; }
+  chipRow.innerHTML = buildInvoiceChips();
+  tableSection.innerHTML = buildInvoiceTableSection();
+  setupInvoiceVirtualTable();
+}
+function setInvoiceFilter(k) { invoiceFilter = k; refreshInvoicesView(); }
 
 function openInvoiceModal(existing) {
   const customers = load(K.customers);
@@ -1387,11 +1484,13 @@ function savePaymentAndWhatsApp(invId) {
 }
 
 // ============= Page: Inventory =============
+let inventoryPage = 1;
 function renderInventory(root) {
   const products = load(K.products);
   const totalValue = products.reduce((s,p) => s + p.costPrice * p.stockQty, 0);
   const retailValue = products.reduce((s,p) => s + p.sellingPrice * p.stockQty, 0);
   const lowStock = products.filter(p => p.stockQty <= p.reorderLevel);
+  const { items: pageItems, page, totalPages } = paginate(products, inventoryPage);
 
   root.innerHTML = `
     <div class="page-header">
@@ -1439,48 +1538,62 @@ function renderInventory(root) {
       </div>
     ` : ''}
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>SKU</th>
-            <th>Product</th>
-            <th>Category</th>
-            <th class="t-num">Cost</th>
-            <th class="t-num">Price</th>
-            <th class="t-num">Stock</th>
-            <th class="t-num">Reorder At</th>
-            <th class="t-num">Value</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          ${products.map(p => {
-            const low = p.stockQty <= p.reorderLevel;
-            return `
-              <tr>
-                <td class="t-mono">${p.sku}</td>
-                <td><div class="bold">${p.name}</div></td>
-                <td><span class="badge badge-info">${p.category}</span></td>
-                <td class="t-num">${fmt(p.costPrice)}</td>
-                <td class="t-num">${p.sellingPrice ? fmt(p.sellingPrice) : '—'}</td>
-                <td class="t-num bold ${low ? 'text-danger' : ''}">${p.stockQty} ${p.unit}</td>
-                <td class="t-num text-mute">${p.reorderLevel}</td>
-                <td class="t-num">${fmt(p.costPrice * p.stockQty)}</td>
-                <td>
-                  <div class="flex gap-sm">
-                    <button class="btn btn-ghost btn-icon" title="Stock In" onclick="openStockInModal('${p.id}')"><i class="material-icons">add_circle</i></button>
-                    <button class="btn btn-ghost btn-icon" title="Stock Out" onclick="openStockOutModal('${p.id}')"><i class="material-icons">remove_circle</i></button>
-                    <button class="btn btn-ghost btn-icon" title="Edit" onclick="openProductModal('${p.id}')"><i class="material-icons">edit</i></button>
-                  </div>
-                </td>
-              </tr>
-            `;
-          }).join('')}
-        </tbody>
-      </table>
-    </div>
+    <div class="table-wrap" id="inventoryTableSection">${buildInventoryTableSection(pageItems, page, totalPages)}</div>
   `;
+}
+function buildInventoryTableSection(pageItems, page, totalPages) {
+  return `
+    <table>
+      <thead>
+        <tr>
+          <th>SKU</th>
+          <th>Product</th>
+          <th>Category</th>
+          <th class="t-num">Cost</th>
+          <th class="t-num">Price</th>
+          <th class="t-num">Stock</th>
+          <th class="t-num">Reorder At</th>
+          <th class="t-num">Value</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        ${pageItems.map(p => {
+          const low = p.stockQty <= p.reorderLevel;
+          return `
+            <tr>
+              <td class="t-mono">${p.sku}</td>
+              <td><div class="bold">${p.name}</div></td>
+              <td><span class="badge badge-info">${p.category}</span></td>
+              <td class="t-num">${fmt(p.costPrice)}</td>
+              <td class="t-num">${p.sellingPrice ? fmt(p.sellingPrice) : '—'}</td>
+              <td class="t-num bold ${low ? 'text-danger' : ''}">${p.stockQty} ${p.unit}</td>
+              <td class="t-num text-mute">${p.reorderLevel}</td>
+              <td class="t-num">${fmt(p.costPrice * p.stockQty)}</td>
+              <td>
+                <div class="flex gap-sm">
+                  <button class="btn btn-ghost btn-icon" title="Stock In" onclick="openStockInModal('${p.id}')"><i class="material-icons">add_circle</i></button>
+                  <button class="btn btn-ghost btn-icon" title="Stock Out" onclick="openStockOutModal('${p.id}')"><i class="material-icons">remove_circle</i></button>
+                  <button class="btn btn-ghost btn-icon" title="Edit" onclick="openProductModal('${p.id}')"><i class="material-icons">edit</i></button>
+                </div>
+              </td>
+            </tr>
+          `;
+        }).join('')}
+      </tbody>
+    </table>
+    ${renderPager(page, totalPages, 'goToInventoryPage')}
+  `;
+}
+// Page-change only swaps stock counts/values which live entirely in this section;
+// KPIs and low-stock banner are unaffected, so a full navigate() rebuild is unnecessary.
+function goToInventoryPage(p) {
+  inventoryPage = p;
+  const section = document.getElementById('inventoryTableSection');
+  if (!section) { navigate('inventory'); return; }
+  const products = load(K.products);
+  const { items: pageItems, page, totalPages } = paginate(products, inventoryPage);
+  section.innerHTML = buildInventoryTableSection(pageItems, page, totalPages);
 }
 function openProductModal(id) {
   const products = load(K.products);
@@ -1705,12 +1818,49 @@ function reorderAllLow() {
 
 // ============= Page: Expenses =============
 let expenseFilter = 'all';
-function renderExpenses(root) {
+let expensePage = 1;
+const EXPENSE_CAT_LABELS = { fuel: 'Fuel', salaries: 'Salaries', utilities: 'Utilities', repairs: 'Repairs', airtime: 'Airtime', other: 'Other' };
+const EXPENSE_CAT_ICONS = { fuel: 'local_gas_station', salaries: 'groups', utilities: 'bolt', repairs: 'build', airtime: 'sim_card', other: 'more_horiz' };
+function buildExpenseChips() {
+  return `
+    <div class="chip ${expenseFilter==='all'?'active':''}" onclick="setExpenseFilter('all')">All Categories</div>
+    ${Object.entries(EXPENSE_CAT_LABELS).map(([k,label]) => `<div class="chip ${expenseFilter===k?'active':''}" onclick="setExpenseFilter('${k}')">${label}</div>`).join('')}
+  `;
+}
+function buildExpenseTableSection() {
   const expenses = load(K.expenses).sort((a,b) => b.date.localeCompare(a.date));
   const filtered = expenseFilter === 'all' ? expenses : expenses.filter(e => e.category === expenseFilter);
   const total = filtered.reduce((s,e) => s + Number(e.amount), 0);
-  const catLabels = { fuel: 'Fuel', salaries: 'Salaries', utilities: 'Utilities', repairs: 'Repairs', airtime: 'Airtime', other: 'Other' };
-  const catIcons = { fuel: 'local_gas_station', salaries: 'groups', utilities: 'bolt', repairs: 'build', airtime: 'sim_card', other: 'more_horiz' };
+  const { items: pageItems, page, totalPages } = paginate(filtered, expensePage);
+  return `
+    <table>
+      <thead>
+        <tr><th>Date</th><th>Category</th><th>Description</th><th>Method</th><th class="t-num">Amount</th><th></th></tr>
+      </thead>
+      <tbody>
+        ${pageItems.length ? pageItems.map(e => `
+          <tr>
+            <td>${fmtDate(e.date)}</td>
+            <td><span class="badge badge-info">${EXPENSE_CAT_LABELS[e.category] || e.category}</span></td>
+            <td>${e.description}</td>
+            <td class="t-mono text-mute" style="font-size:11px;text-transform:uppercase">${e.paymentMethod}</td>
+            <td class="t-num bold">${fmt(e.amount)}</td>
+            <td>
+              <div class="flex gap-sm">
+                <button class="btn btn-ghost btn-icon" onclick="openExpenseModal('${e.id}')"><i class="material-icons">edit</i></button>
+                <button class="btn btn-ghost btn-icon" onclick="deleteExpense('${e.id}')"><i class="material-icons">delete</i></button>
+              </div>
+            </td>
+          </tr>
+        `).join('') : `<tr><td colspan="6"><div class="empty"><i class="material-icons">payments</i><p>No expenses recorded.</p></div></td></tr>`}
+      </tbody>
+      ${filtered.length ? `<tfoot><tr><td colspan="4" class="bold text-right">TOTAL</td><td class="t-num bold text-primary" style="font-size:15px">${fmt(total)}</td><td></td></tr></tfoot>` : ''}
+    </table>
+    ${renderPager(page, totalPages, 'goToExpensePage')}
+  `;
+}
+function renderExpenses(root) {
+  const expenses = load(K.expenses);
 
   root.innerHTML = `
     <div class="page-header">
@@ -1722,50 +1872,33 @@ function renderExpenses(root) {
     </div>
 
     <div class="grid-6 mb-md" style="display:grid;grid-template-columns:repeat(6,1fr);gap:10px">
-      ${Object.entries(catLabels).map(([k,label]) => {
+      ${Object.entries(EXPENSE_CAT_LABELS).map(([k,label]) => {
         const total = expenses.filter(e => e.category === k).reduce((s,e) => s + Number(e.amount), 0);
         return `
           <div class="card" style="padding:14px;cursor:pointer" onclick="setExpenseFilter('${k}')">
-            <div class="flex gap-sm"><i class="material-icons" style="color:var(--accent);font-size:18px">${catIcons[k]}</i><span class="eyebrow" style="font-size:9px">${label}</span></div>
+            <div class="flex gap-sm"><i class="material-icons" style="color:var(--accent);font-size:18px">${EXPENSE_CAT_ICONS[k]}</i><span class="eyebrow" style="font-size:9px">${label}</span></div>
             <div class="text-num bold text-primary" style="font-size:17px;margin-top:6px">${fmt(total)}</div>
           </div>
         `;
       }).join('')}
     </div>
 
-    <div class="chip-row">
-      <div class="chip ${expenseFilter==='all'?'active':''}" onclick="setExpenseFilter('all')">All Categories</div>
-      ${Object.entries(catLabels).map(([k,label]) => `<div class="chip ${expenseFilter===k?'active':''}" onclick="setExpenseFilter('${k}')">${label}</div>`).join('')}
-    </div>
+    <div class="chip-row" id="expenseChipRow">${buildExpenseChips()}</div>
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Date</th><th>Category</th><th>Description</th><th>Method</th><th class="t-num">Amount</th><th></th></tr>
-        </thead>
-        <tbody>
-          ${filtered.length ? filtered.map(e => `
-            <tr>
-              <td>${fmtDate(e.date)}</td>
-              <td><span class="badge badge-info">${catLabels[e.category] || e.category}</span></td>
-              <td>${e.description}</td>
-              <td class="t-mono text-mute" style="font-size:11px;text-transform:uppercase">${e.paymentMethod}</td>
-              <td class="t-num bold">${fmt(e.amount)}</td>
-              <td>
-                <div class="flex gap-sm">
-                  <button class="btn btn-ghost btn-icon" onclick="openExpenseModal('${e.id}')"><i class="material-icons">edit</i></button>
-                  <button class="btn btn-ghost btn-icon" onclick="deleteExpense('${e.id}')"><i class="material-icons">delete</i></button>
-                </div>
-              </td>
-            </tr>
-          `).join('') : `<tr><td colspan="6"><div class="empty"><i class="material-icons">payments</i><p>No expenses recorded.</p></div></td></tr>`}
-        </tbody>
-        ${filtered.length ? `<tfoot><tr><td colspan="4" class="bold text-right">TOTAL</td><td class="t-num bold text-primary" style="font-size:15px">${fmt(total)}</td><td></td></tr></tfoot>` : ''}
-      </table>
-    </div>
+    <div class="table-wrap" id="expenseTableSection">${buildExpenseTableSection()}</div>
   `;
 }
-function setExpenseFilter(k) { expenseFilter = k; navigate('expenses'); }
+// Filter/page changes only touch the chip states and the table; the category
+// summary cards above are unaffected, so we patch in place instead of a full navigate().
+function refreshExpensesView() {
+  const chipRow = document.getElementById('expenseChipRow');
+  const tableSection = document.getElementById('expenseTableSection');
+  if (!chipRow || !tableSection) { navigate('expenses'); return; }
+  chipRow.innerHTML = buildExpenseChips();
+  tableSection.innerHTML = buildExpenseTableSection();
+}
+function setExpenseFilter(k) { expenseFilter = k; expensePage = 1; refreshExpensesView(); }
+function goToExpensePage(p) { expensePage = p; refreshExpensesView(); }
 function openExpenseModal(id) {
   const expenses = load(K.expenses);
   const e = id ? expenses.find(x => x.id === id) : { id: uid('e'), date: today(), category: 'fuel', description: '', amount: 0, paymentMethod: 'cash', supplierId: '' };
@@ -1847,21 +1980,68 @@ function deleteExpense(id) {
 
 // ============= Page: Debtors & Creditors =============
 let partiesTab = 'customers';
+let partiesPage = 1;
+function buildPartiesChips() {
+  return `
+    <div class="chip ${partiesTab==='customers'?'active':''}" onclick="setPartiesTab('customers')">Customers (Debtors)</div>
+    <div class="chip ${partiesTab==='suppliers'?'active':''}" onclick="setPartiesTab('suppliers')">Suppliers (Creditors)</div>
+  `;
+}
+// Builds customer/supplier balances in one pass over invoices (grouped by customerId)
+// instead of re-filtering the full invoices array once per customer/supplier row.
+function applyPartyBalances(customers, suppliers) {
+  const invoices = load(K.invoices);
+  const byCustomer = {};
+  invoices.forEach(i => {
+    if (!i.customerId || i.type === 'quotation' || i.type === 'credit_note') return;
+    const entry = byCustomer[i.customerId] || (byCustomer[i.customerId] = { invoiced: 0, paid: 0 });
+    entry.invoiced += i.total;
+    entry.paid += (i.payments || []).reduce((p, pay) => p + pay.amount, 0);
+  });
+  customers.forEach(c => {
+    const entry = byCustomer[c.id];
+    c.balance = c.openingBalance + (entry ? entry.invoiced - entry.paid : 0);
+  });
+  suppliers.forEach(s => { s.balance = s.openingBalance; });
+}
+function buildPartiesTableSection() {
+  const customers = load(K.customers);
+  const suppliers = load(K.suppliers);
+  applyPartyBalances(customers, suppliers);
+  const activeList = partiesTab === 'customers' ? customers : suppliers;
+  const { items: pageItems, page, totalPages } = paginate(activeList, partiesPage);
+  return `
+    <table>
+      <thead>
+        <tr><th>Name</th><th>Phone</th><th>Email</th><th>Address</th><th class="t-num">Opening Bal</th><th class="t-num">Current Balance</th><th></th></tr>
+      </thead>
+      <tbody>
+        ${pageItems.map(p => `
+          <tr>
+            <td class="bold">${p.name}</td>
+            <td class="t-mono">${p.phone || '—'}</td>
+            <td>${p.email || '—'}</td>
+            <td class="text-mute" style="font-size:12px">${p.address || '—'}</td>
+            <td class="t-num">${fmt(p.openingBalance)}</td>
+            <td class="t-num bold ${p.balance > 0 ? 'text-danger' : p.balance < 0 ? 'text-success' : ''}">${fmt(p.balance)}</td>
+            <td>
+              <div class="flex gap-sm">
+                ${p.phone ? `<button class="btn btn-wa btn-icon" title="WhatsApp" onclick="sendPartyWhatsApp('${p.id}','${partiesTab}')"><i class="material-icons">chat</i></button>` : ''}
+                <button class="btn btn-ghost btn-icon" title="Statement" onclick="viewPartyStatement('${p.id}','${partiesTab}')"><i class="material-icons">description</i></button>
+                <button class="btn btn-ghost btn-icon" title="Edit" onclick="openPartyModal('${partiesTab}','${p.id}')"><i class="material-icons">edit</i></button>
+              </div>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+    ${renderPager(page, totalPages, 'goToPartiesPage')}
+  `;
+}
 function renderParties(root) {
   const customers = load(K.customers);
   const suppliers = load(K.suppliers);
-  const invoices = load(K.invoices);
-
-  // Compute balances
-  customers.forEach(c => {
-    const custInvs = invoices.filter(i => i.customerId === c.id && i.type !== 'quotation' && i.type !== 'credit_note');
-    const invoiced = custInvs.reduce((s,i) => s + i.total, 0);
-    const paid = custInvs.reduce((s,i) => s + (i.payments||[]).reduce((p,pay) => p + pay.amount, 0), 0);
-    c.balance = c.openingBalance + invoiced - paid;
-  });
-  suppliers.forEach(s => {
-    s.balance = s.openingBalance;
-  });
+  applyPartyBalances(customers, suppliers);
 
   const totalDebtors = customers.reduce((s,c) => s + Math.max(0, c.balance), 0);
   const totalCreditors = suppliers.reduce((s,sup) => s + Math.max(0, sup.balance), 0);
@@ -1872,7 +2052,7 @@ function renderParties(root) {
         <h2>Debtors &amp; Creditors</h2>
         <div class="sub">Customer and supplier accounts with full payment history.</div>
       </div>
-      <button class="btn btn-primary" onclick="openPartyModal('${partiesTab}')"><i class="material-icons">add</i>New ${partiesTab === 'customers' ? 'Customer' : 'Supplier'}</button>
+      <button class="btn btn-primary" id="partyAddBtn" onclick="openPartyModal('${partiesTab}')"><i class="material-icons">add</i>New ${partiesTab === 'customers' ? 'Customer' : 'Supplier'}</button>
     </div>
 
     <div class="grid-2 mb-md">
@@ -1888,40 +2068,25 @@ function renderParties(root) {
       </div>
     </div>
 
-    <div class="chip-row">
-      <div class="chip ${partiesTab==='customers'?'active':''}" onclick="setPartiesTab('customers')">Customers (Debtors)</div>
-      <div class="chip ${partiesTab==='suppliers'?'active':''}" onclick="setPartiesTab('suppliers')">Suppliers (Creditors)</div>
-    </div>
+    <div class="chip-row" id="partyChipRow">${buildPartiesChips()}</div>
 
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Name</th><th>Phone</th><th>Email</th><th>Address</th><th class="t-num">Opening Bal</th><th class="t-num">Current Balance</th><th></th></tr>
-        </thead>
-        <tbody>
-          ${(partiesTab === 'customers' ? customers : suppliers).map(p => `
-            <tr>
-              <td class="bold">${p.name}</td>
-              <td class="t-mono">${p.phone || '—'}</td>
-              <td>${p.email || '—'}</td>
-              <td class="text-mute" style="font-size:12px">${p.address || '—'}</td>
-              <td class="t-num">${fmt(p.openingBalance)}</td>
-              <td class="t-num bold ${p.balance > 0 ? 'text-danger' : p.balance < 0 ? 'text-success' : ''}">${fmt(p.balance)}</td>
-              <td>
-                <div class="flex gap-sm">
-                  ${p.phone ? `<button class="btn btn-wa btn-icon" title="WhatsApp" onclick="sendPartyWhatsApp('${p.id}','${partiesTab}')"><i class="material-icons">chat</i></button>` : ''}
-                  <button class="btn btn-ghost btn-icon" title="Statement" onclick="viewPartyStatement('${p.id}','${partiesTab}')"><i class="material-icons">description</i></button>
-                  <button class="btn btn-ghost btn-icon" title="Edit" onclick="openPartyModal('${partiesTab}','${p.id}')"><i class="material-icons">edit</i></button>
-                </div>
-              </td>
-            </tr>
-          `).join('')}
-        </tbody>
-      </table>
-    </div>
+    <div class="table-wrap" id="partyTableSection">${buildPartiesTableSection()}</div>
   `;
 }
-function setPartiesTab(t) { partiesTab = t; navigate('parties'); }
+// Tab/page changes leave the KPI totals (both tabs' totals show regardless of
+// active tab) untouched, so only the add-button label, chips, and table are patched.
+function refreshPartiesView() {
+  const addBtn = document.getElementById('partyAddBtn');
+  const chipRow = document.getElementById('partyChipRow');
+  const tableSection = document.getElementById('partyTableSection');
+  if (!addBtn || !chipRow || !tableSection) { navigate('parties'); return; }
+  addBtn.innerHTML = `<i class="material-icons">add</i>New ${partiesTab === 'customers' ? 'Customer' : 'Supplier'}`;
+  addBtn.setAttribute('onclick', `openPartyModal('${partiesTab}')`);
+  chipRow.innerHTML = buildPartiesChips();
+  tableSection.innerHTML = buildPartiesTableSection();
+}
+function setPartiesTab(t) { partiesTab = t; partiesPage = 1; refreshPartiesView(); }
+function goToPartiesPage(p) { partiesPage = p; refreshPartiesView(); }
 function openPartyModal(type, id) {
   const list = load(type === 'customers' ? K.customers : K.suppliers);
   const p = id ? list.find(x => x.id === id) : { id: uid(type === 'customers' ? 'c' : 's'), name:'', phone:'', email:'', address:'', openingBalance: 0 };
@@ -2364,11 +2529,12 @@ function renderReports(root) {
   const year = today().slice(0,4);
 
   // YTD P&L
+  const productsById = indexById(products);
   const ytdInvs = invoices.filter(i => i.date.startsWith(year));
   const sales = ytdInvs.reduce((s,i) => s + i.subtotal, 0);
   const vatCollected = ytdInvs.reduce((s,i) => s + i.vatAmount, 0);
   const cogs = ytdInvs.reduce((s,i) => s + i.items.reduce((cs, it) => {
-    const p = products.find(x => x.id === it.productId);
+    const p = productsById[it.productId];
     return cs + (p ? p.costPrice * it.qty : 0);
   }, 0), 0);
   const grossProfit = sales - cogs;
@@ -2548,7 +2714,7 @@ function renderSettings(root) {
         <button class="btn btn-ghost" onclick="exportData()"><i class="material-icons">download</i>Export Data (JSON)</button>
         <button class="btn btn-ghost" onclick="document.getElementById('importFile').click()"><i class="material-icons">upload</i>Import Data</button>
         <input type="file" id="importFile" accept=".json" style="display:none" onchange="importData(event)">
-        <button class="btn btn-danger" onclick="resetData()"><i class="material-icons">restart_alt</i>Reset to Demo Data</button>
+        <button class="btn btn-danger" onclick="resetData()"><i class="material-icons">restart_alt</i>Clear All Data</button>
       </div>
     </div>
   `;
@@ -2587,6 +2753,8 @@ function importData(e) {
     try {
       const data = JSON.parse(ev.target.result);
       Object.entries(data).forEach(([k, v]) => localStorage.setItem(k, JSON.stringify(v)));
+      dataCache = {};
+      dataVersion++;
       toast('Data imported successfully', 'success');
       setTimeout(() => location.reload(), 1000);
     } catch (err) {
@@ -2596,11 +2764,10 @@ function importData(e) {
   reader.readAsText(file);
 }
 function resetData() {
-  if (!confirm('This will erase all your data and reload demo data. Continue?')) return;
+  if (!confirm('This will permanently erase all your data (customers, suppliers, products, invoices, expenses, employees, settings). This cannot be undone. Continue?')) return;
   Object.values(K).forEach(k => localStorage.removeItem(k));
-  localStorage.removeItem(K.seeded);
   seedIfEmpty();
-  toast('Demo data reloaded', 'success');
+  toast('All data cleared', 'success');
   setTimeout(() => location.reload(), 800);
 }
 
