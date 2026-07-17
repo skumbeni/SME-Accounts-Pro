@@ -718,6 +718,26 @@ function destroyCharts() {
   Object.values(chartRegistry).forEach(c => { try { c.destroy(); } catch {} });
   chartRegistry = {};
 }
+// Reuses an existing Chart.js instance (new data + chart.update()) whenever its
+// canvas element is still the one it was created on — avoids the destroy/rebuild
+// (and accompanying flash) that a fresh `new Chart()` causes on every dashboard visit.
+// Only actually falls back to recreate when the canvas node itself was replaced,
+// i.e. after a real full-page navigation away from and back to the dashboard.
+function updateOrCreateChart(key, canvasId, config) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return null;
+  const existing = chartRegistry[key];
+  if (existing && existing.canvas === canvas) {
+    existing.data.labels = config.data.labels;
+    existing.data.datasets = config.data.datasets;
+    existing.update();
+    return existing;
+  }
+  if (existing) { try { existing.destroy(); } catch {} }
+  const chart = new Chart(canvas, config);
+  chartRegistry[key] = chart;
+  return chart;
+}
 // Aggregating 6 months of invoices / this month's expenses is the expensive part of
 // loading the dashboard, not the Chart.js instantiation itself. Cache the aggregated
 // result and only recompute when the underlying data (or the calendar month) has
@@ -766,19 +786,30 @@ const ROUTES = {
   settings: { title: 'Settings', crumb: 'Setup', render: renderSettings }
 };
 
+let currentRoute = null;
+function updateInvoiceBadge() {
+  const unpaidCount = load(K.invoices).filter(i => i.status === 'overdue').length;
+  document.getElementById('invBadge').textContent = unpaidCount;
+  document.getElementById('invBadge').style.display = unpaidCount ? 'inline-flex' : 'none';
+}
 function navigate(route) {
   const r = ROUTES[route] || ROUTES.dashboard;
   document.getElementById('pageTitle').textContent = r.title;
   document.getElementById('crumb').textContent = r.crumb;
   document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.route === route));
-  destroyCharts();
-  const content = document.getElementById('pageContent');
-  content.innerHTML = '';
-  r.render(content);
-  // Update invoice badge
-  const unpaidCount = load(K.invoices).filter(i => i.status === 'overdue').length;
-  document.getElementById('invBadge').textContent = unpaidCount;
-  document.getElementById('invBadge').style.display = unpaidCount ? 'inline-flex' : 'none';
+  // Re-selecting the dashboard while it's already the active view is a data refresh,
+  // not a real navigation — patch numbers/tables/charts in place (see
+  // refreshDashboardData) instead of tearing down and rebuilding the whole page.
+  if (route === 'dashboard' && currentRoute === 'dashboard' && document.getElementById('salesChart')) {
+    refreshDashboardData();
+  } else {
+    destroyCharts();
+    const content = document.getElementById('pageContent');
+    content.innerHTML = '';
+    r.render(content);
+  }
+  currentRoute = route;
+  updateInvoiceBadge();
   location.hash = route;
 }
 
@@ -799,6 +830,36 @@ document.getElementById('hamburgerBtn').addEventListener('click', openSidebar);
 document.getElementById('sidebarBackdrop').addEventListener('click', closeSidebar);
 
 // ============= Page: Dashboard =============
+// Patches the dashboard's KPI numbers, recent-invoices/low-stock tables, and chart
+// data in place, keeping the existing <canvas> nodes alive so updateOrCreateChart()
+// can update() rather than destroy/recreate the Chart.js instances.
+function refreshDashboardData() {
+  const s = getDashboardStats();
+  const products = load(K.products);
+  const lowStock = products.filter(p => p.stockQty <= p.reorderLevel);
+  const invoices = load(K.invoices);
+
+  document.getElementById('dailySalesKpi').textContent = fmt(s.dailySales);
+  document.getElementById('dailySalesSub').textContent = `${invoices.filter(i => i.date === today()).length} invoices today`;
+  document.getElementById('monthlySalesKpi').textContent = fmt(s.monthlySales);
+  document.getElementById('netProfitKpi').textContent = fmt(s.netProfit);
+  const netProfitSub = document.getElementById('netProfitSub');
+  netProfitSub.textContent = `${s.netProfit >= 0 ? 'Profit' : 'Loss'} · MTD`;
+  netProfitSub.className = `kpi-sub ${s.netProfit >= 0 ? 'up' : 'down'}`;
+  document.getElementById('taxDueKpi').textContent = fmt(s.taxDue);
+  document.getElementById('taxDueSub').textContent = `VAT ${fmt(s.vatCollected)} · TOT ${fmt(s.turnoverTax)}`;
+  document.getElementById('outstandingKpi').textContent = fmt(s.outstanding);
+  document.getElementById('outstandingSub').textContent = `${invoices.filter(i => i.status === 'overdue').length} overdue invoices`;
+  document.getElementById('inventoryValueKpi').textContent = fmt(s.inventoryValue);
+  const invValueSub = document.getElementById('inventoryValueSub');
+  invValueSub.textContent = `${lowStock.length} low-stock ${lowStock.length === 1 ? 'item' : 'items'}`;
+  invValueSub.className = `kpi-sub ${lowStock.length ? 'down' : ''}`;
+
+  document.getElementById('recentInvoicesCard').innerHTML = renderRecentInvoicesTable();
+  document.getElementById('lowStockCard').innerHTML = renderLowStockTable(lowStock);
+
+  renderDashboardCharts();
+}
 function renderDashboard(root) {
   const s = getDashboardStats();
   const products = load(K.products);
@@ -821,33 +882,33 @@ function renderDashboard(root) {
     <div class="kpi-grid">
       <div class="kpi-card">
         <div class="kpi-label"><i class="material-icons">today</i>Daily Sales</div>
-        <div class="kpi-value">${fmt(s.dailySales)}</div>
-        <div class="kpi-sub">${invoices.filter(i => i.date === today()).length} invoices today</div>
+        <div class="kpi-value" id="dailySalesKpi">${fmt(s.dailySales)}</div>
+        <div class="kpi-sub" id="dailySalesSub">${invoices.filter(i => i.date === today()).length} invoices today</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label"><i class="material-icons">calendar_month</i>Monthly Sales</div>
-        <div class="kpi-value">${fmt(s.monthlySales)}</div>
+        <div class="kpi-value" id="monthlySalesKpi">${fmt(s.monthlySales)}</div>
         <div class="kpi-sub">${monthLabel(currentMonthKey())} · MTD</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label"><i class="material-icons">payments</i>Net Profit</div>
-        <div class="kpi-value">${fmt(s.netProfit)}</div>
-        <div class="kpi-sub ${s.netProfit >= 0 ? 'up' : 'down'}">${s.netProfit >= 0 ? 'Profit' : 'Loss'} · MTD</div>
+        <div class="kpi-value" id="netProfitKpi">${fmt(s.netProfit)}</div>
+        <div class="kpi-sub ${s.netProfit >= 0 ? 'up' : 'down'}" id="netProfitSub">${s.netProfit >= 0 ? 'Profit' : 'Loss'} · MTD</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label"><i class="material-icons">gavel</i>Tax Due</div>
-        <div class="kpi-value">${fmt(s.taxDue)}</div>
-        <div class="kpi-sub">VAT ${fmt(s.vatCollected)} · TOT ${fmt(s.turnoverTax)}</div>
+        <div class="kpi-value" id="taxDueKpi">${fmt(s.taxDue)}</div>
+        <div class="kpi-sub" id="taxDueSub">VAT ${fmt(s.vatCollected)} · TOT ${fmt(s.turnoverTax)}</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label"><i class="material-icons">schedule</i>Outstanding Debtors</div>
-        <div class="kpi-value">${fmt(s.outstanding)}</div>
-        <div class="kpi-sub down">${invoices.filter(i => i.status === 'overdue').length} overdue invoices</div>
+        <div class="kpi-value" id="outstandingKpi">${fmt(s.outstanding)}</div>
+        <div class="kpi-sub down" id="outstandingSub">${invoices.filter(i => i.status === 'overdue').length} overdue invoices</div>
       </div>
       <div class="kpi-card">
         <div class="kpi-label"><i class="material-icons">inventory_2</i>Inventory Value</div>
-        <div class="kpi-value">${fmt(s.inventoryValue)}</div>
-        <div class="kpi-sub ${lowStock.length ? 'down' : ''}">${lowStock.length} low-stock ${lowStock.length === 1 ? 'item' : 'items'}</div>
+        <div class="kpi-value" id="inventoryValueKpi">${fmt(s.inventoryValue)}</div>
+        <div class="kpi-sub ${lowStock.length ? 'down' : ''}" id="inventoryValueSub">${lowStock.length} low-stock ${lowStock.length === 1 ? 'item' : 'items'}</div>
       </div>
     </div>
 
@@ -874,36 +935,23 @@ function renderDashboard(root) {
           <h3>Recent Invoices</h3>
           <button class="btn btn-ghost btn-sm" onclick="navigate('invoices')">View all</button>
         </div>
-        ${renderRecentInvoicesTable()}
+        <div id="recentInvoicesCard">${renderRecentInvoicesTable()}</div>
       </div>
       <div class="card">
         <div class="card-title">
           <h3>Low Stock Alerts</h3>
           <button class="btn btn-ghost btn-sm" onclick="navigate('inventory')">Manage</button>
         </div>
-        ${lowStock.length ? `
-          <table>
-            <thead><tr><th>Product</th><th class="t-num">Stock</th><th class="t-num">Reorder At</th><th></th></tr></thead>
-            <tbody>
-              ${lowStock.slice(0,5).map(p => `
-                <tr>
-                  <td><div class="bold">${p.name}</div><div class="text-mute" style="font-size:11px">${p.sku}</div></td>
-                  <td class="t-num text-danger bold">${p.stockQty} ${p.unit}</td>
-                  <td class="t-num text-mute">${p.reorderLevel}</td>
-                  <td><button class="btn btn-accent btn-sm" onclick="openStockInModal('${p.id}')">Reorder</button></td>
-                </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        ` : `<div class="empty"><i class="material-icons">check_circle</i><p>All stock levels healthy.</p></div>`}
+        <div id="lowStockCard">${renderLowStockTable(lowStock)}</div>
       </div>
     </div>
   `;
 
-  // Sales chart (last 6 months) — aggregation is cached, only rebuilt when data/month changes
-  const { sales, expense } = getDashboardChartData();
+  renderDashboardCharts();
+}
 
-  chartRegistry.sales = new Chart(document.getElementById('salesChart'), {
+function buildSalesChartConfig(sales) {
+  return {
     type: 'bar',
     data: {
       labels: sales.labels,
@@ -923,10 +971,10 @@ function renderDashboard(root) {
         x: { grid: { display: false } }
       }
     }
-  });
-
-  // Expense chart
-  chartRegistry.expense = new Chart(document.getElementById('expenseChart'), {
+  };
+}
+function buildExpenseChartConfig(expense) {
+  return {
     type: 'doughnut',
     data: {
       labels: expense.labels,
@@ -943,9 +991,36 @@ function renderDashboard(root) {
         tooltip: { callbacks: { label: ctx => ctx.label + ': ' + fmt(ctx.parsed) } }
       }
     }
-  });
+  };
+}
+// Builds (first dashboard visit) or refreshes (subsequent visits, canvases already
+// present) both charts. updateOrCreateChart reuses the existing Chart.js instance
+// via chart.update() whenever the canvas node hasn't been replaced, instead of
+// destroying and reinstantiating on every visit.
+function renderDashboardCharts() {
+  const { sales, expense } = getDashboardChartData(); // aggregation itself is cached, only recomputed when data/month changes
+  updateOrCreateChart('sales', 'salesChart', buildSalesChartConfig(sales));
+  updateOrCreateChart('expense', 'expenseChart', buildExpenseChartConfig(expense));
 }
 
+function renderLowStockTable(lowStock) {
+  if (!lowStock.length) return `<div class="empty"><i class="material-icons">check_circle</i><p>All stock levels healthy.</p></div>`;
+  return `
+    <table>
+      <thead><tr><th>Product</th><th class="t-num">Stock</th><th class="t-num">Reorder At</th><th></th></tr></thead>
+      <tbody>
+        ${lowStock.slice(0,5).map(p => `
+          <tr>
+            <td><div class="bold">${p.name}</div><div class="text-mute" style="font-size:11px">${p.sku}</div></td>
+            <td class="t-num text-danger bold">${p.stockQty} ${p.unit}</td>
+            <td class="t-num text-mute">${p.reorderLevel}</td>
+            <td><button class="btn btn-accent btn-sm" onclick="openStockInModal('${p.id}')">Reorder</button></td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+}
 function renderRecentInvoicesTable() {
   const invoices = load(K.invoices).sort((a,b) => b.date.localeCompare(a.date)).slice(0,5);
   const customersById = indexById(load(K.customers));
@@ -1081,8 +1156,10 @@ function renderInvoices(root) {
   `;
   setupInvoiceVirtualTable();
 }
-// In-page updates (filter change) patch only the chip row and table instead of
-// tearing down and rebuilding the whole page via navigate().
+// In-page updates (filter change, or after saving/paying an invoice) patch only the
+// chip row, table, and sidebar badge instead of tearing down and rebuilding the
+// whole page via navigate() — the Invoices page has no summary KPI cards that
+// depend on invoice data, so this is a complete refresh, not a partial one.
 function refreshInvoicesView() {
   const chipRow = document.getElementById('invoiceChipRow');
   const tableSection = document.getElementById('invoiceTableSection');
@@ -1090,6 +1167,7 @@ function refreshInvoicesView() {
   chipRow.innerHTML = buildInvoiceChips();
   tableSection.innerHTML = buildInvoiceTableSection();
   setupInvoiceVirtualTable();
+  updateInvoiceBadge();
 }
 function setInvoiceFilter(k) { invoiceFilter = k; refreshInvoicesView(); }
 
@@ -1310,7 +1388,7 @@ function saveInvoice(e, id, isEdit) {
   }
   closeModal();
   toast(`Document ${inv.number} saved`, 'success');
-  navigate('invoices');
+  refreshInvoicesView();
 }
 function saveAndSend(id, isEdit) {
   const inv = collectInvoiceFormData(id, isEdit);
@@ -1319,7 +1397,7 @@ function saveAndSend(id, isEdit) {
   updateInvoice(inv);
   closeModal();
   sendInvoiceWhatsApp(inv);
-  navigate('invoices');
+  refreshInvoicesView();
 }
 function viewInvoice(id) {
   const inv = load(K.invoices).find(i => i.id === id);
@@ -1458,7 +1536,7 @@ function savePayment(e, invId) {
   save(K.invoices, invoices);
   closeModal();
   toast(`Payment of ${fmt(amount)} recorded`, 'success');
-  navigate('invoices');
+  refreshInvoicesView();
 }
 function savePaymentAndWhatsApp(invId) {
   const amount = Number(document.getElementById('payAmount').value);
@@ -1480,7 +1558,7 @@ function savePaymentAndWhatsApp(invId) {
   } else {
     toast('Customer has no phone — payment saved only', 'warn');
   }
-  navigate('invoices');
+  refreshInvoicesView();
 }
 
 // ============= Page: Inventory =============
